@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# --- Base de Datos / SQL ---
+# Ignorar backups locales de la base de datos si los haces
+*.sql
+# Nota: Si quieres mantener tus scripts de creación de tablas en el repo, 
+# comenta la línea anterior con un #
+
+# --- Railway / Entorno ---
+# Ignorar logs locales de ejecución
+*.log
+.railway/
+
+# --- Editores ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Dependencias ---
+# Es mejor no subir las librerías instaladas, 
+# Railway las instalará desde requirements.txt
+/lib/
+/bin/
+/include/
