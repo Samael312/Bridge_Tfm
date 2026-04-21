@@ -2,7 +2,13 @@
 bridge.py — Railway
 -------------------
 Suscriptor MQTT que persiste en PostgreSQL.
-Escucha TODOS los sensores bajo el topic base (uja/#).
+
+Topics soportados (ambos, con y sin slash inicial):
+  uja/{sensor_id}/{variable}
+ /uja/{sensor_id}/{variable}
+
+El mock por defecto publica a /uja/... por lo que es necesario
+suscribirse a ambas variantes.
 """
 
 import json
@@ -17,22 +23,30 @@ import paho.mqtt.client as mqtt
 # CONFIGURACIÓN DESDE VARIABLES DE ENTORNO
 # ==========================================
 DB_URL      = os.getenv("DATABASE_URL")
-# Acepta tanto MQTT_BROKER como MQTT_HOST para compatibilidad
-MQTT_BROKER = os.getenv("MQTT_HOST", "autorack.proxy.rlwy.net")
-MQTT_PORT   = int(os.getenv("MQTT_PORT", 35512))
-# El topic base sin slash inicial (ej: "uja")
-MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "uja").lstrip("/")
-# Suscripción a todos los sensores: uja/#
-TOPIC_SUB   = f"{MQTT_TOPIC_BASE}/#"
+MQTT_BROKER = os.getenv("MQTT_BROKER", os.getenv("MQTT_HOST", "mqtt-server"))
+MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
+
+# MQTT_TOPIC_BASE puede llegar con o sin slash inicial (ej: "uja" o "/uja")
+# Normalizamos a SIN slash para comparaciones internas
+_RAW_BASE       = os.getenv("MQTT_TOPIC_BASE", "/uja")
+MQTT_TOPIC_BASE = _RAW_BASE.lstrip("/")          # → "uja"
+
+# Suscribirse a AMBAS variantes porque el mock usa "/uja" por defecto
+TOPIC_SUB_NO_SLASH = f"{MQTT_TOPIC_BASE}/#"      # uja/#
+TOPIC_SUB_SLASH    = f"/{MQTT_TOPIC_BASE}/#"     # /uja/#
 
 print("=" * 60)
 print("🚀 Iniciando Bridge MQTT → Postgres")
-print(f"   MQTT_BROKER    : {MQTT_BROKER}")
-print(f"   MQTT_PORT      : {MQTT_PORT}")
-print(f"   MQTT_TOPIC_BASE: {MQTT_TOPIC_BASE}")
-print(f"   TOPIC_SUB      : {TOPIC_SUB}")
-print(f"   DATABASE_URL   : {'SET' if DB_URL else '❌ NO DEFINIDA'}")
+print(f"   MQTT_BROKER      : {MQTT_BROKER}")
+print(f"   MQTT_PORT        : {MQTT_PORT}")
+print(f"   MQTT_TOPIC_BASE  : '{_RAW_BASE}' → normalizado: '{MQTT_TOPIC_BASE}'")
+print(f"   SUSCRIPCIÓN #1   : {TOPIC_SUB_NO_SLASH}")
+print(f"   SUSCRIPCIÓN #2   : {TOPIC_SUB_SLASH}")
+print(f"   DATABASE_URL     : {'✅ SET' if DB_URL else '❌ NO DEFINIDA — ABORTANDO'}")
 print("=" * 60)
+
+if not DB_URL:
+    raise RuntimeError("DATABASE_URL no está definida")
 
 # ==========================================
 # VARIABLES SFA CONOCIDAS
@@ -44,34 +58,32 @@ KNOWN_VARIABLES = {
     "v_bateria",
     "i_carga",
     "temp_pan",
-    "temp_bat",   # ← era "tamp_bat" (typo corregido)
+    "temp_bat",    # ← corregido (era "tamp_bat")
 }
 
-print(f"📋 Variables conocidas: {KNOWN_VARIABLES}")
+print(f"📋 Variables conocidas: {sorted(KNOWN_VARIABLES)}")
 
 # ==========================================
 # HELPER: PARSEAR TOPIC
-# Formato esperado: uja/{sensor_id}/{variable}
+# Acepta tanto "uja/s1/radiacion" como "/uja/s1/radiacion"
 # ==========================================
 def _parse_topic(topic: str):
     """
-    Extrae (sensor_id, variable) de cualquier topic con formato:
-      {MQTT_TOPIC_BASE}/{sensor_id}/{variable}
-    Devuelve (None, None) si el formato no coincide.
+    Extrae (sensor_id, variable) normalizando el slash inicial.
+    Formato: [/]uja/{sensor_id}/{variable}
     """
-    prefix = MQTT_TOPIC_BASE + "/"
-    if not topic.startswith(prefix):
-        print(f"   ⚠️  Topic '{topic}' no empieza por '{prefix}' — ignorando")
+    clean = topic.lstrip("/")               # quitar slash inicial si existe
+    prefix = MQTT_TOPIC_BASE + "/"          # "uja/"
+
+    if not clean.startswith(prefix):
         return None, None
 
-    rest = topic[len(prefix):]      # "s1/radiacion" o "s2/v_bateria"
+    rest = clean[len(prefix):]              # "s2/radiacion"
     parts = rest.split("/")
     if len(parts) != 2:
-        print(f"   ⚠️  Topic '{topic}' tiene estructura inesperada (partes={parts}) — ignorando")
         return None, None
 
-    sensor_id, variable = parts[0], parts[1]
-    return sensor_id, variable
+    return parts[0], parts[1]              # ("s2", "radiacion")
 
 
 # ==========================================
@@ -82,25 +94,24 @@ cursor = None
 
 while True:
     try:
-        print("🔗 Conectando a PostgreSQL...")
+        print("\n🔗 Conectando a PostgreSQL...")
         conn   = psycopg2.connect(DB_URL)
         cursor = conn.cursor()
-        print("✅ Conexión a PostgreSQL establecida")
+        print("✅ PostgreSQL conectado")
 
-        # ── Tablas ──────────────────────────────────────────────
-        print("🏗️  Creando/verificando tablas...")
+        print("🏗️  Creando/verificando esquema...")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(255) UNIQUE NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                name VARCHAR(255),
-                surname VARCHAR(255),
-                password_hash VARCHAR(255) NOT NULL,
-                reset_token VARCHAR(255),
+                id                  SERIAL PRIMARY KEY,
+                username            VARCHAR(255) UNIQUE NOT NULL,
+                email               VARCHAR(255) UNIQUE NOT NULL,
+                name                VARCHAR(255),
+                surname             VARCHAR(255),
+                password_hash       VARCHAR(255) NOT NULL,
+                reset_token         VARCHAR(255),
                 reset_token_expires TIMESTAMPTZ,
-                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                created_at          TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
@@ -144,34 +155,32 @@ while True:
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS alert_rules (
-                id         BIGSERIAL    PRIMARY KEY,
-                sensor_id  VARCHAR(64)  NOT NULL,
-                variable   VARCHAR(64)  NOT NULL,
-                operator   VARCHAR(2)   NOT NULL,
-                threshold  DOUBLE PRECISION NOT NULL,
-                level      VARCHAR(10)  NOT NULL DEFAULT 'warning',
-                message    TEXT         NOT NULL,
-                created_at TIMESTAMPTZ  DEFAULT NOW(),
+                id        BIGSERIAL        PRIMARY KEY,
+                sensor_id VARCHAR(64)      NOT NULL,
+                variable  VARCHAR(64)      NOT NULL,
+                operator  VARCHAR(2)       NOT NULL,
+                threshold DOUBLE PRECISION NOT NULL,
+                level     VARCHAR(10)      NOT NULL DEFAULT 'warning',
+                message   TEXT             NOT NULL,
+                created_at TIMESTAMPTZ     DEFAULT NOW(),
                 UNIQUE (sensor_id, variable, operator)
             );
         """)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS alert_snooze (
-                id         BIGSERIAL    PRIMARY KEY,
-                sensor_id  VARCHAR(64)  NOT NULL,
+                id         BIGSERIAL   PRIMARY KEY,
+                sensor_id  VARCHAR(64) NOT NULL,
                 variable   VARCHAR(64),
-                until_ts   TIMESTAMPTZ  NOT NULL,
-                created_at TIMESTAMPTZ  DEFAULT NOW(),
+                until_ts   TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW(),
                 UNIQUE (sensor_id, variable)
             );
             CREATE INDEX IF NOT EXISTS idx_alert_snooze_sensor
                 ON alert_snooze (sensor_id, until_ts DESC);
         """)
 
-        # ── Trigger NOTIFY ──────────────────────────────────────
-        print("⚡ Configurando trigger NOTIFY...")
-
+        # Trigger NOTIFY para WebSocket en tiempo real
         cursor.execute("""
             CREATE OR REPLACE FUNCTION notify_sfa_update()
             RETURNS trigger AS $$
@@ -195,20 +204,26 @@ while True:
             DROP TRIGGER IF EXISTS trg_sfa_update ON sfa_readings;
             CREATE TRIGGER trg_sfa_update
             AFTER INSERT ON sfa_readings
-            FOR EACH ROW
-            EXECUTE FUNCTION notify_sfa_update();
+            FOR EACH ROW EXECUTE FUNCTION notify_sfa_update();
         """)
 
         conn.commit()
-        print("✅ Esquema de BD listo (tablas, índices, triggers)")
+        print("✅ Esquema listo (tablas + índices + triggers)")
 
-        # ── Estadísticas iniciales ──────────────────────────────
-        cursor.execute("SELECT sensor_id, COUNT(*) FROM sfa_readings GROUP BY sensor_id ORDER BY sensor_id")
+        # Estado actual de la BD
+        cursor.execute("""
+            SELECT sensor_id, COUNT(*) as total,
+                   MAX(timestamp) as ultimo,
+                   EXTRACT(EPOCH FROM (NOW() - MAX(timestamp)))/60 as minutos_ago
+            FROM sfa_readings
+            GROUP BY sensor_id ORDER BY sensor_id
+        """)
         rows = cursor.fetchall()
         if rows:
-            print("📊 Lecturas actuales en BD:")
+            print("\n📊 Estado actual en BD:")
             for r in rows:
-                print(f"   sensor={r[0]}  filas={r[1]}")
+                mins = int(r[3]) if r[3] else None
+                print(f"   sensor={r[0]}  filas={r[1]}  último dato hace {mins}m")
         else:
             print("📊 BD vacía — sin lecturas previas")
 
@@ -222,14 +237,13 @@ while True:
 
 
 # ==========================================
-# CONTADORES DE DIAGNÓSTICO
+# CONTADORES
 # ==========================================
 _stats = {
-    "mensajes_recibidos": 0,
-    "lecturas_insertadas": 0,
-    "errores": 0,
-    "topics_ignorados": 0,
-    "variables_ignoradas": 0,
+    "recibidos":  0,
+    "insertados": 0,
+    "ignorados":  0,
+    "errores":    0,
 }
 
 
@@ -244,8 +258,7 @@ def _insert_telemetria(topic: str, payload_dict: dict) -> int:
     return cursor.fetchone()[0]
 
 
-def _insert_reading(sensor_id: str, variable: str, value: float,
-                    timestamp: datetime, source: str, telemetria_id: int) -> int:
+def _insert_reading(sensor_id, variable, value, timestamp, source, telemetria_id):
     cursor.execute("""
         INSERT INTO sfa_readings
             (timestamp, sensor_id, variable, value, source, telemetria_id)
@@ -260,34 +273,43 @@ def _insert_reading(sensor_id: str, variable: str, value: float,
 # ==========================================
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
-        print(f"✅ Conectado al broker MQTT: {MQTT_BROKER}:{MQTT_PORT}")
-        result, mid = client.subscribe(TOPIC_SUB)
-        print(f"📡 Suscrito a '{TOPIC_SUB}' (result={result}, mid={mid})")
+        print(f"\n✅ Conectado al broker MQTT: {MQTT_BROKER}:{MQTT_PORT}")
+        # Suscribir a AMBAS variantes (con y sin slash inicial)
+        r1, m1 = client.subscribe(TOPIC_SUB_NO_SLASH)
+        r2, m2 = client.subscribe(TOPIC_SUB_SLASH)
+        print(f"📡 Suscrito a '{TOPIC_SUB_NO_SLASH}' (rc={r1}, mid={m1})")
+        print(f"📡 Suscrito a '{TOPIC_SUB_SLASH}'  (rc={r2}, mid={m2})")
     else:
-        codes = {1: "protocolo", 2: "client_id", 3: "broker no disponible",
-                 4: "credenciales", 5: "no autorizado"}
-        print(f"❌ Fallo MQTT connect — rc={rc} ({codes.get(rc, 'desconocido')})")
+        codes = {
+            1: "protocolo incompatible",
+            2: "client_id inválido",
+            3: "broker no disponible",
+            4: "credenciales incorrectas",
+            5: "no autorizado",
+        }
+        print(f"❌ Fallo MQTT connect rc={rc}: {codes.get(rc, 'desconocido')}")
 
 
 def on_disconnect(client, userdata, rc, properties=None):
     if rc == 0:
-        print("🔌 Desconectado limpiamente del broker MQTT")
+        print("🔌 Desconectado limpiamente del broker")
     else:
-        print(f"⚠️  Desconexión inesperada del broker MQTT (rc={rc}) — paho reconectará")
+        print(f"⚠️  Desconexión inesperada rc={rc} — paho reconectará automáticamente")
 
 
 def on_subscribe(client, userdata, mid, granted_qos, properties=None):
-    print(f"✅ Suscripción confirmada: mid={mid}, QoS={granted_qos}")
+    print(f"✅ Suscripción confirmada mid={mid} QoS={granted_qos}")
 
 
 def on_message(client, userdata, msg):
-    _stats["mensajes_recibidos"] += 1
+    _stats["recibidos"] += 1
     topic = msg.topic
 
-    # Log cada 10 mensajes para no saturar
-    verbose = (_stats["mensajes_recibidos"] % 10 == 1)
+    # Log detallado primer mensaje y luego cada 20
+    verbose = (_stats["recibidos"] == 1 or _stats["recibidos"] % 20 == 0)
     if verbose:
-        print(f"\n📨 Mensaje #{_stats['mensajes_recibidos']} en '{topic}'")
+        print(f"\n📨 Mensaje #{_stats['recibidos']} | topic='{topic}' | "
+              f"insertados={_stats['insertados']} errores={_stats['errores']}")
 
     try:
         raw = msg.payload.decode()
@@ -295,28 +317,27 @@ def on_message(client, userdata, msg):
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
-            print(f"   ⚠️  Payload no es JSON: {raw[:80]}")
+            print(f"   ⚠️  Payload no es JSON: {raw[:100]}")
             payload = {"raw_text": raw}
 
-        # 1. Insertar en telemetria (siempre)
+        # 1. Log en telemetria (siempre)
         tel_id = _insert_telemetria(topic, payload)
 
-        # 2. Parsear topic
+        # 2. Parsear topic (normaliza slash inicial)
         sensor_id, variable = _parse_topic(topic)
 
         if sensor_id is None:
-            _stats["topics_ignorados"] += 1
+            _stats["ignorados"] += 1
+            if verbose:
+                print(f"   ⚠️  Topic '{topic}' no coincide con base '{MQTT_TOPIC_BASE}' — ignorado")
             conn.commit()
             return
 
-        if verbose:
-            print(f"   sensor_id={sensor_id}  variable={variable}")
-
-        # 3. Verificar variable conocida
+        # 3. Variable conocida
         if variable not in KNOWN_VARIABLES:
-            _stats["variables_ignoradas"] += 1
+            _stats["ignorados"] += 1
             if verbose:
-                print(f"   ⚠️  Variable '{variable}' no está en KNOWN_VARIABLES — solo guardado en telemetria")
+                print(f"   ⚠️  Variable '{variable}' desconocida — solo en telemetria")
             conn.commit()
             return
 
@@ -325,7 +346,7 @@ def on_message(client, userdata, msg):
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
-            print(f"   ❌ No se pudo convertir a float: raw_value={raw_value!r}")
+            print(f"   ❌ Valor no convertible: {raw_value!r} en topic={topic}")
             _stats["errores"] += 1
             conn.commit()
             return
@@ -345,32 +366,31 @@ def on_message(client, userdata, msg):
 
         source = payload.get("source", "mqtt")
 
-        # 6. Insertar reading
+        # 6. Insertar reading → dispara NOTIFY automáticamente via trigger
         reading_id = _insert_reading(sensor_id, variable, value, ts, source, tel_id)
-        _stats["lecturas_insertadas"] += 1
-
         conn.commit()
 
-        print(f"   ✅ [{sensor_id}] {variable}={value} src={source} reading_id={reading_id}"
-              f"  [total insertadas: {_stats['lecturas_insertadas']}]")
+        _stats["insertados"] += 1
+        print(f"   ✅ [{sensor_id}] {variable}={value} src={source} "
+              f"reading_id={reading_id} (total={_stats['insertados']})")
 
     except Exception as e:
         _stats["errores"] += 1
-        print(f"   ❌ Error procesando mensaje: {e}")
+        print(f"   ❌ Error procesando '{topic}': {e}")
         if conn:
             conn.rollback()
 
 
 def on_log(client, userdata, level, buf):
-    # Solo mostrar errores internos de paho
+    # Solo errores internos de paho
     if level <= mqtt.MQTT_LOG_WARNING:
-        print(f"   [paho] {buf}")
+        print(f"   [paho-warn] {buf}")
 
 
 # ==========================================
 # CLIENTE MQTT
 # ==========================================
-print("\n🔌 Creando cliente MQTT...")
+print("\n🔌 Configurando cliente MQTT...")
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 client.on_connect    = on_connect
 client.on_disconnect = on_disconnect
@@ -382,19 +402,18 @@ print(f"🔄 Conectando a {MQTT_BROKER}:{MQTT_PORT}...")
 while True:
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-        print("✅ Conexión MQTT establecida")
         break
     except Exception as e:
         print(f"⏳ Broker no disponible ({e}) — reintentando en 5s...")
         time.sleep(5)
 
-print("\n🎧 Escuchando mensajes MQTT... (Ctrl+C para detener)\n")
+print("\n🎧 Esperando mensajes MQTT...\n")
 
 try:
     client.loop_forever()
 except KeyboardInterrupt:
-    print("\n🛑 Bridge detenido manualmente")
-    print(f"📊 Estadísticas finales: {_stats}")
+    print("\n🛑 Bridge detenido")
+    print(f"📊 Estadísticas: {_stats}")
 finally:
     if cursor: cursor.close()
     if conn:   conn.close()
