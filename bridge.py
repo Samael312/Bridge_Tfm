@@ -352,8 +352,14 @@ def on_message(client, userdata, msg):
             return
 
         # 4. Extraer valor numérico
-        raw_value = payload.get("value") or payload.get(variable)
+        if "value" in payload:
+            raw_value = payload["value"]
+        else:
+            raw_value = payload.get(variable)
+
         try:
+            if raw_value is None:
+                raise ValueError("No se encontró el campo de valor en el JSON")
             value = float(raw_value)
         except (TypeError, ValueError):
             print(f"   ❌ Valor no convertible: {raw_value!r} en topic={topic}")
@@ -364,12 +370,14 @@ def on_message(client, userdata, msg):
         # 5. Timestamp
         ts_raw = payload.get("timestamp")
         if ts_raw:
+            # Corregir el formato de fecha: cambiar "YYYY/MM/DD" a "YYYY-MM-DD"
+            ts_raw_fixed = ts_raw.replace("/", "-")
             try:
-                ts = datetime.fromisoformat(ts_raw)
+                ts = datetime.fromisoformat(ts_raw_fixed)
                 if ts.tzinfo is None:
                     ts = ts.replace(tzinfo=timezone.utc)
             except ValueError:
-                print(f"   ⚠️  Timestamp inválido '{ts_raw}' — usando NOW()")
+                print(f"   ⚠️ Timestamp inválido '{ts_raw}' — usando NOW()")
                 ts = datetime.now(timezone.utc)
         else:
             ts = datetime.now(timezone.utc)
