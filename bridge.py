@@ -138,6 +138,16 @@ while True:
                 ON sfa_readings (sensor_id, variable, timestamp DESC);
         """)
 
+        cursor.execute(""" 
+            CREATE TABLE IF NOT EXISTS soc_state (
+            sensor_id       VARCHAR(64)      PRIMARY KEY,
+            soc_pct         DOUBLE PRECISION NOT NULL DEFAULT 50.0,
+            last_calibrated TIMESTAMPTZ,
+            calibration_soc DOUBLE PRECISION,
+            updated_at      TIMESTAMPTZ      DEFAULT NOW()
+            );
+        """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS sfa_alerts (
                 id         BIGSERIAL        PRIMARY KEY,
