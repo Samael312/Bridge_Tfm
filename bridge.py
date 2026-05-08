@@ -3,6 +3,13 @@ bridge.py — Railway
 -------------------
 Suscriptor MQTT que persiste en PostgreSQL.
 
+CORRECCIÓN: Los timestamps que envía el sensor sin offset (ej: "2026-04-30T08:13:24")
+se interpretan ahora como hora local española (Europe/Madrid) en vez de UTC,
+evitando el desfase de +2h que aparecía en el dashboard en horario de verano.
+
+La zona horaria del sensor es configurable via variable de entorno SENSOR_TIMEZONE
+(por defecto "Europe/Madrid").
+
 Topics soportados (ambos, con y sin slash inicial):
   uja/{sensor_id}/{variable}
  /uja/{sensor_id}/{variable}
@@ -15,6 +22,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo   # Python 3.9+
 
 import psycopg2
 import paho.mqtt.client as mqtt
@@ -26,12 +34,14 @@ DB_URL      = os.getenv("DATABASE_URL")
 MQTT_BROKER = os.getenv("MQTT_BROKER", os.getenv("MQTT_HOST", "mqtt-server"))
 MQTT_PORT   = int(os.getenv("MQTT_PORT", 1883))
 
-# MQTT_TOPIC_BASE puede llegar con o sin slash inicial (ej: "uja" o "/uja")
-# Normalizamos a SIN slash para comparaciones internas
+# Zona horaria del sensor. Si el payload no incluye offset (+HH:MM),
+# el timestamp se interpreta en esta zona y se convierte a UTC antes de guardar.
+SENSOR_TIMEZONE = os.getenv("SENSOR_TIMEZONE", "Europe/Madrid")
+_SENSOR_TZ      = ZoneInfo(SENSOR_TIMEZONE)
+
 _RAW_BASE       = os.getenv("MQTT_TOPIC_BASE", "/uja")
 MQTT_TOPIC_BASE = _RAW_BASE.lstrip("/")          # → "uja"
 
-# Suscribirse a AMBAS variantes porque el mock usa "/uja" por defecto
 TOPIC_SUB_NO_SLASH = f"{MQTT_TOPIC_BASE}/#"      # uja/#
 TOPIC_SUB_SLASH    = f"/{MQTT_TOPIC_BASE}/#"     # /uja/#
 
@@ -42,6 +52,7 @@ print(f"   MQTT_PORT        : {MQTT_PORT}")
 print(f"   MQTT_TOPIC_BASE  : '{_RAW_BASE}' → normalizado: '{MQTT_TOPIC_BASE}'")
 print(f"   SUSCRIPCIÓN #1   : {TOPIC_SUB_NO_SLASH}")
 print(f"   SUSCRIPCIÓN #2   : {TOPIC_SUB_SLASH}")
+print(f"   SENSOR_TIMEZONE  : {SENSOR_TIMEZONE}")
 print(f"   DATABASE_URL     : {'✅ SET' if DB_URL else '❌ NO DEFINIDA — ABORTANDO'}")
 print("=" * 60)
 
@@ -58,10 +69,11 @@ KNOWN_VARIABLES = {
     "v_bateria",
     "i_carga",
     "temp_pan",
-    "temp_bat",    # ← corregido (era "tamp_bat")
+    "temp_bat",
 }
 
 print(f"📋 Variables conocidas: {sorted(KNOWN_VARIABLES)}")
+
 
 # ==========================================
 # HELPER: PARSEAR TOPIC
@@ -72,18 +84,63 @@ def _parse_topic(topic: str):
     Extrae (sensor_id, variable) normalizando el slash inicial.
     Formato: [/]uja/{sensor_id}/{variable}
     """
-    clean = topic.lstrip("/")               # quitar slash inicial si existe
-    prefix = MQTT_TOPIC_BASE + "/"          # "uja/"
+    clean  = topic.lstrip("/")
+    prefix = MQTT_TOPIC_BASE + "/"
 
     if not clean.startswith(prefix):
         return None, None
 
-    rest = clean[len(prefix):]              # "s2/radiacion"
+    rest  = clean[len(prefix):]
     parts = rest.split("/")
     if len(parts) != 2:
         return None, None
 
-    return parts[0], parts[1]              # ("s2", "radiacion")
+    return parts[0], parts[1]
+
+
+# ==========================================
+# HELPER: PARSEAR TIMESTAMP  ← CORRECCIÓN PRINCIPAL
+# ==========================================
+def _parse_timestamp(ts_raw: str | None) -> datetime:
+    """
+    Convierte el timestamp del payload a datetime UTC aware.
+
+    Casos:
+      1. None o vacío          → NOW() UTC
+      2. Con offset explícito  → respeta el offset y convierte a UTC
+         ej: "2026-04-30T08:13:24+00:00" → 08:13 UTC  (datos mock, ya correctos)
+         ej: "2026-04-30T10:13:24+02:00" → 08:13 UTC
+      3. Sin offset (naive)    → interpreta como SENSOR_TIMEZONE y convierte a UTC
+         ej: "2026-04-30T08:13:24"       → 06:13 UTC  (España verano UTC+2)
+
+    ANTES (bug): el caso 3 hacía ts.replace(tzinfo=timezone.utc), guardando
+    "08:13 UTC" cuando en realidad eran las 08:13 hora española = 06:13 UTC.
+    El frontend luego mostraba new Date("...08:13+00:00") → 10:13 hora española.
+
+    AHORA: el caso 3 interpreta correctamente como hora local del sensor
+    antes de persistir en BD.
+    """
+    if not ts_raw:
+        return datetime.now(timezone.utc)
+
+    # Algunos sensores usan "/" como separador de fecha en vez de "-"
+    ts_fixed = ts_raw.replace("/", "-")
+
+    try:
+        ts = datetime.fromisoformat(ts_fixed)
+    except ValueError:
+        print(f"   ⚠️  Timestamp no parseable '{ts_raw}' — usando NOW()")
+        return datetime.now(timezone.utc)
+
+    if ts.tzinfo is None:
+        # ← CORRECCIÓN: antes era ts.replace(tzinfo=timezone.utc)
+        # Ahora interpretamos como hora local del sensor y convertimos a UTC
+        ts = ts.replace(tzinfo=_SENSOR_TZ).astimezone(timezone.utc)
+    else:
+        # Ya tiene offset explícito → normalizar a UTC
+        ts = ts.astimezone(timezone.utc)
+
+    return ts
 
 
 # ==========================================
@@ -138,13 +195,13 @@ while True:
                 ON sfa_readings (sensor_id, variable, timestamp DESC);
         """)
 
-        cursor.execute(""" 
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS soc_state (
-            sensor_id       VARCHAR(64)      PRIMARY KEY,
-            soc_pct         DOUBLE PRECISION NOT NULL DEFAULT 50.0,
-            last_calibrated TIMESTAMPTZ,
-            calibration_soc DOUBLE PRECISION,
-            updated_at      TIMESTAMPTZ      DEFAULT NOW()
+                sensor_id       VARCHAR(64)      PRIMARY KEY,
+                soc_pct         DOUBLE PRECISION NOT NULL DEFAULT 50.0,
+                last_calibrated TIMESTAMPTZ,
+                calibration_soc DOUBLE PRECISION,
+                updated_at      TIMESTAMPTZ      DEFAULT NOW()
             );
         """)
 
@@ -190,7 +247,6 @@ while True:
                 ON alert_snooze (sensor_id, until_ts DESC);
         """)
 
-        # Trigger NOTIFY para WebSocket en tiempo real
         cursor.execute("""
             CREATE OR REPLACE FUNCTION notify_sfa_update()
             RETURNS trigger AS $$
@@ -220,7 +276,6 @@ while True:
         conn.commit()
         print("✅ Esquema listo (tablas + índices + triggers)")
 
-        # Estado actual de la BD
         cursor.execute("""
             SELECT sensor_id, COUNT(*) as total,
                    MAX(timestamp) as ultimo,
@@ -284,7 +339,6 @@ def _insert_reading(sensor_id, variable, value, timestamp, source, telemetria_id
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print(f"\n✅ Conectado al broker MQTT: {MQTT_BROKER}:{MQTT_PORT}")
-        # Suscribir a AMBAS variantes (con y sin slash inicial)
         r1, m1 = client.subscribe(TOPIC_SUB_NO_SLASH)
         r2, m2 = client.subscribe(TOPIC_SUB_SLASH)
         print(f"📡 Suscrito a '{TOPIC_SUB_NO_SLASH}' (rc={r1}, mid={m1})")
@@ -315,7 +369,6 @@ def on_message(client, userdata, msg):
     _stats["recibidos"] += 1
     topic = msg.topic
 
-    # Log detallado primer mensaje y luego cada 20
     verbose = (_stats["recibidos"] == 1 or _stats["recibidos"] % 20 == 0)
     if verbose:
         print(f"\n📨 Mensaje #{_stats['recibidos']} | topic='{topic}' | "
@@ -367,21 +420,8 @@ def on_message(client, userdata, msg):
             conn.commit()
             return
 
-        # 5. Timestamp
-        ts_raw = payload.get("timestamp")
-        if ts_raw:
-            # Corregir el formato de fecha: cambiar "YYYY/MM/DD" a "YYYY-MM-DD"
-            ts_raw_fixed = ts_raw.replace("/", "-")
-            try:
-                ts = datetime.fromisoformat(ts_raw_fixed)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except ValueError:
-                print(f"   ⚠️ Timestamp inválido '{ts_raw}' — usando NOW()")
-                ts = datetime.now(timezone.utc)
-        else:
-            ts = datetime.now(timezone.utc)
-
+        # 5. Timestamp ← función corregida
+        ts     = _parse_timestamp(payload.get("timestamp"))
         source = payload.get("source", "mqtt")
 
         # 6. Insertar reading → dispara NOTIFY automáticamente via trigger
@@ -389,8 +429,10 @@ def on_message(client, userdata, msg):
         conn.commit()
 
         _stats["insertados"] += 1
-        print(f"   ✅ [{sensor_id}] {variable}={value} src={source} "
-              f"reading_id={reading_id} (total={_stats['insertados']})")
+        if verbose:
+            print(f"   ✅ [{sensor_id}] {variable}={value} src={source} "
+                  f"ts_utc={ts.strftime('%H:%M:%S')} reading_id={reading_id} "
+                  f"(total={_stats['insertados']})")
 
     except Exception as e:
         _stats["errores"] += 1
@@ -400,7 +442,6 @@ def on_message(client, userdata, msg):
 
 
 def on_log(client, userdata, level, buf):
-    # Solo errores internos de paho
     if level <= mqtt.MQTT_LOG_WARNING:
         print(f"   [paho-warn] {buf}")
 
