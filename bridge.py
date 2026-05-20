@@ -300,11 +300,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
         print(f"❌ Fallo MQTT connect rc={rc}: {codes.get(rc, 'desconocido')}")
 
 
-def on_disconnect(client, userdata, rc, properties=None):
-    if rc == 0:
+def on_disconnect(client, userdata, flags, reason_code, properties=None):
+    if reason_code == 0:
         print("🔌 Desconectado limpiamente del broker")
     else:
-        print(f"⚠️  Desconexión inesperada rc={rc} — paho reconectará automáticamente")
+        print(f"⚠️  Desconexión inesperada rc={reason_code} — paho reconectará automáticamente")
 
 
 def on_subscribe(client, userdata, mid, granted_qos, properties=None):
